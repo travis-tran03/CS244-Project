@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT Vertical Slice Dashboard</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --mute:#94a3b8; --ok:#22c55e; --bad:#ef4444; --t:#f97316; --p:#38bdf8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.4 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 22px; border-bottom:1px solid #334155; }
+  h1 { font-size:18px; margin:0; }
+  #status { padding:4px 12px; border-radius:999px; font-weight:600; font-size:13px; background:#475569; }
+  #status.live { background:var(--ok); color:#052e16; }
+  #status.stale { background:var(--bad); color:#450a0a; }
+  main { max-width:1100px; margin:0 auto; padding:18px; display:grid; gap:16px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
+  .card { background:var(--card); border-radius:10px; padding:16px; }
+  .label { color:var(--mute); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+  .big { font-size:44px; font-weight:700; margin:4px 0; font-variant-numeric:tabular-nums; }
+  .big small { font-size:18px; color:var(--mute); font-weight:500; }
+  .sub { color:var(--mute); font-size:13px; }
+  canvas { width:100%; height:220px; display:block; }
+  .row { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  select { background:#0f172a; color:var(--fg); border:1px solid #475569; border-radius:6px; padding:3px 6px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; font-size:13px; }
+  th, td { text-align:right; padding:4px 8px; border-bottom:1px solid #334155; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--mute); font-weight:500; }
+</style>
+</head>
+<body>
+<header>
+  <h1>IoT Vertical Slice &mdash; BMP280 &rarr; ESP32 &rarr; Wi-Fi &rarr; Server</h1>
+  <span id="status">waiting for data&hellip;</span>
+</header>
+<main>
+  <section class="tiles">
+    <div class="card"><div class="label">Temperature</div>
+      <div class="big" id="temp">--<small> &deg;C</small></div><div class="sub" id="tempf"></div></div>
+    <div class="card"><div class="label">Pressure</div>
+      <div class="big" id="pres">--<small> hPa</small></div><div class="sub">&nbsp;</div></div>
+    <div class="card"><div class="label">Last reading</div>
+      <div class="big" id="age" style="font-size:30px">--</div>
+      <div class="sub" id="meta">device &middot; seq &middot; Wi-Fi RSSI</div></div>
+    <div class="card"><div class="label">Stored readings</div>
+      <div class="big" id="total" style="font-size:30px">--</div>
+      <div class="sub" id="gaps">&nbsp;</div></div>
+  </section>
+
+  <section class="card">
+    <div class="row"><span class="label">History</span>
+      <label class="sub">window
+        <select id="win">
+          <option value="5">5 min</option><option value="30">30 min</option>
+          <option value="60" selected>1 hour</option><option value="360">6 hours</option>
+          <option value="1440">24 hours</option><option value="4320">3 days</option>
+        </select></label></div>
+    <div class="sub">Temperature (&deg;C)</div><canvas id="ct"></canvas>
+    <div class="sub" style="margin-top:10px">Pressure (hPa)</div><canvas id="cp"></canvas>
+  </section>
+
+  <section class="card">
+    <div class="label" style="margin-bottom:6px">Recent readings</div>
+    <table><thead><tr><th>Time</th><th>Seq</th><th>Temp &deg;C</th><th>Pressure hPa</th><th>RSSI dBm</th></tr></thead>
+    <tbody id="rows"></tbody></table>
+  </section>
+</main>
+
+<script>
+const STALE_S = 30;            // red badge if no reading for this long
+let lastT = null, skew = 0;    // skew = server clock - browser clock
+
+const $ = id => document.getElementById(id);
+const fmtTime = t => new Date(t * 1000).toLocaleTimeString();
+
+function setStatus() {
+  const s = $('status');
+  if (lastT === null) { s.textContent = 'waiting for data…'; s.className = ''; return; }
+  const age = Date.now() / 1000 + skew - lastT;
+  $('age').textContent = age < 90 ? age.toFixed(0) + ' s ago' : fmtTime(lastT);
+  if (age > STALE_S) { s.textContent = 'STALE (' + Math.round(age) + ' s)'; s.className = 'stale'; }
+  else { s.textContent = 'LIVE'; s.className = 'live'; }
+}
+
+async function pollLatest() {
+  try {
+    const j = await (await fetch('/api/latest')).json();
+    skew = j.now - Date.now() / 1000;
+    const r = j.reading;
+    if (r) {
+      lastT = r.t;
+      $('temp').innerHTML = r.temp_c.toFixed(2) + '<small> °C</small>';
+      $('tempf').textContent = (r.temp_c * 9 / 5 + 32).toFixed(1) + ' °F';
+      $('pres').innerHTML = r.pressure_hpa.toFixed(2) + '<small> hPa</small>';
+      $('meta').textContent = r.device + ' · seq ' + r.seq + ' · ' + (r.rssi ?? '?') + ' dBm';
+    }
+  } catch (e) { /* server briefly unreachable: badge goes stale on its own */ }
+  setStatus();
+}
+
+function drawChart(canvas, pts, color, unit) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const c = canvas.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, w, h);
+  const L = 52, R = 8, T = 8, B = 20;
+  c.font = '11px system-ui'; c.fillStyle = '#94a3b8'; c.strokeStyle = '#334155';
+  if (pts.length < 1) { c.fillText('no data in this window', L + 10, h / 2); return; }
+  let t0 = pts[0][0], t1 = pts[pts.length - 1][0]; if (t1 - t0 < 1) t1 = t0 + 1;
+  let lo = Math.min(...pts.map(p => p[1])), hi = Math.max(...pts.map(p => p[1]));
+  if (hi - lo < 0.2) { const m = (hi + lo) / 2; lo = m - 0.1; hi = m + 0.1; }
+  const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
+  const X = t => L + (t - t0) / (t1 - t0) * (w - L - R);
+  const Y = v => T + (1 - (v - lo) / (hi - lo)) * (h - T - B);
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    c.beginPath(); c.moveTo(L, y); c.lineTo(w - R, y); c.stroke();
+    c.fillText(v.toFixed(2), 4, y + 4);
+  }
+  c.fillText(fmtTime(t0), L, h - 5);
+  const e = fmtTime(t1); c.fillText(e, w - R - c.measureText(e).width, h - 5);
+  c.strokeStyle = color; c.lineWidth = 2; c.beginPath();
+  pts.forEach((p, i) => i ? c.lineTo(X(p[0]), Y(p[1])) : c.moveTo(X(p[0]), Y(p[1])));
+  c.stroke();
+  c.fillStyle = color;
+  if (pts.length < 200) pts.forEach(p => { c.beginPath(); c.arc(X(p[0]), Y(p[1]), 2.5, 0, 7); c.fill(); });
+}
+
+async function pollHistory() {
+  try {
+    const j = await (await fetch('/api/readings?minutes=' + $('win').value)).json();
+    const rs = j.readings;
+    $('total').textContent = j.total;
+    drawChart($('ct'), rs.map(r => [r.t, r.temp_c]), '#f97316');
+    drawChart($('cp'), rs.map(r => [r.t, r.pressure_hpa]), '#38bdf8');
+    $('rows').innerHTML = rs.slice(-10).reverse().map(r =>
+      `<tr><td>${fmtTime(r.t)}</td><td>${r.seq}</td><td>${r.temp_c.toFixed(2)}</td>` +
+      `<td>${r.pressure_hpa.toFixed(2)}</td><td>${r.rssi ?? ''}</td></tr>`).join('');
+    // Gap detection: a seq that does not go up by exactly 1 (within one device boot) = lost message(s).
+    let lost = 0;
+    for (let i = 1; i < rs.length; i++) {
+      const d = rs[i].seq - rs[i - 1].seq;
+      if (rs[i].device === rs[i - 1].device && d > 1) lost += d - 1;
+    }
+    $('gaps').textContent = lost ? lost + ' message(s) missing in this window' : 'no missing sequence numbers';
+  } catch (e) {}
+}
+
+$('win').onchange = pollHistory;
+window.onresize = pollHistory;
+pollLatest(); pollHistory();
+setInterval(pollLatest, 1000);
+setInterval(pollHistory, 5000);
+setInterval(setStatus, 1000);
+</script>
+</body>
+</html>

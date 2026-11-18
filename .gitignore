@@ -1,0 +1,11 @@
+# Credentials: never commit
+firmware/include/secrets.h
+*.env
+.env
+
+# Build output / data
+.pio/
+.vscode/
+__pycache__/
+*.db
+*.db-journal
