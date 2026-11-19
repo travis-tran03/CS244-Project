@@ -1,6 +1,8 @@
 # Credentials: never commit
 firmware/include/secrets.h
 *.env
+*.pem
+*.key
 .env
 
 # Build output / data

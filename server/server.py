@@ -10,14 +10,22 @@ Security notes (see README):
   * Every POST must carry X-Signature = hex(HMAC-SHA256(key, raw_body)). Unsigned or badly
     signed posts are rejected with 401, so there is no unauthenticated write path.
   * Readings are range-checked before they are stored.
-  * Traffic is plain HTTP on the LAN: the signature proves who sent a reading, but does not
-    hide it. Put TLS in front of this before leaving a trusted network.
+  * Replay protection: each signed body carries a per-boot random boot_id and a seq counter.
+    A (device, boot_id, seq) that is not strictly greater than the highest one seen is
+    rejected with 409, so a captured POST cannot be re-sent.
+  * Optional TLS: set IOT_TLS_CERT and IOT_TLS_KEY to serve HTTPS (the firmware pins the CA).
+  * The dashboard and read APIs require HTTP Basic auth (IOT_DASH_PASSWORD). The server
+    refuses to start without it unless IOT_ALLOW_OPEN_DASHBOARD=1 is set explicitly.
+  * Known placeholder keys/passwords from the examples are refused at startup.
 """
 import hashlib
 import hmac
 import json
 import os
+import base64
+import re
 import sqlite3
+import ssl
 import sys
 import threading
 import time
@@ -30,6 +38,15 @@ DB_PATH = os.environ.get("IOT_DB", str(HERE / "readings.db"))
 HOST = os.environ.get("IOT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("IOT_PORT", "8000"))
 MAX_BODY = 2048
+TLS_CERT = os.environ.get("IOT_TLS_CERT", "")
+TLS_KEY = os.environ.get("IOT_TLS_KEY", "")
+DASH_USER = os.environ.get("IOT_DASH_USER", "admin")
+DASH_PASSWORD = os.environ.get("IOT_DASH_PASSWORD", "")
+ALLOW_OPEN_DASH = os.environ.get("IOT_ALLOW_OPEN_DASHBOARD", "") == "1"
+BOOT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+# Values copied from the examples/README: never acceptable as real secrets.
+DEFAULT_SECRETS = {"change-me-to-a-long-random-string", "test-key-12345", "changeme", "password",
+                   "admin", "12345678", "<the same key as in secrets.h>"}
 
 # Physical sanity limits (BMP280 operating range: -40..85 C, 300..1100 hPa).
 LIMITS = {"temp_c": (-40.0, 85.0), "pressure_hpa": (300.0, 1100.0)}
@@ -40,9 +57,20 @@ _db = None
 
 def get_key() -> bytes:
     key = os.environ.get("IOT_SHARED_KEY", "")
-    if len(key) < 8:
-        sys.exit("Set IOT_SHARED_KEY (at least 8 characters) before starting the server.")
+    if len(key) < 16:
+        sys.exit("Set IOT_SHARED_KEY (at least 16 characters) before starting the server.")
+    if key in DEFAULT_SECRETS:
+        sys.exit("IOT_SHARED_KEY is a known placeholder value. Generate a random key.")
     return key.encode()
+
+
+def check_dashboard_auth_config() -> None:
+    if DASH_PASSWORD:
+        if len(DASH_PASSWORD) < 10 or DASH_PASSWORD in DEFAULT_SECRETS:
+            sys.exit("IOT_DASH_PASSWORD must be at least 10 characters and not a default value.")
+    elif not ALLOW_OPEN_DASH:
+        sys.exit("Set IOT_DASH_PASSWORD to protect the dashboard "
+                 "(or IOT_ALLOW_OPEN_DASHBOARD=1 for a throwaway local demo).")
 
 
 def init_db() -> None:
@@ -57,9 +85,14 @@ def init_db() -> None:
                uptime_s      INTEGER,
                temp_c        REAL    NOT NULL,
                pressure_hpa  REAL    NOT NULL,
-               rssi          INTEGER
+               rssi          INTEGER,
+               boot_id       TEXT                -- random per device boot (replay protection)
            )"""
     )
+    cols = [r[1] for r in _db.execute("PRAGMA table_info(readings)")]
+    if "boot_id" not in cols:  # database created by an older version
+        _db.execute("ALTER TABLE readings ADD COLUMN boot_id TEXT")
+    _db.execute("CREATE INDEX IF NOT EXISTS idx_readings_boot ON readings(device, boot_id, seq)")
     _db.execute("CREATE INDEX IF NOT EXISTS idx_readings_time ON readings(received_at)")
     _db.commit()
 
@@ -77,6 +110,10 @@ def validate(doc: dict):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= v <= hi):
             return None, f"{field} missing or out of range [{lo}, {hi}]"
         out[field] = float(v)
+    boot_id = doc.get("boot_id")
+    if not isinstance(boot_id, str) or not BOOT_ID_RE.match(boot_id):
+        return None, "boot_id must be 8 lowercase hex characters"
+    out["boot_id"] = boot_id
     for field in ("seq", "uptime_s", "rssi"):
         v = doc.get(field)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
@@ -98,7 +135,8 @@ COLS = "id, received_at, device, seq, uptime_s, temp_c, pressure_hpa, rssi"
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "iot-slice/1.0"
+    server_version = "iot-slice"   # no version/Python banner
+    sys_version = ""
 
     def log_message(self, fmt, *args):  # one tidy line per request
         sys.stderr.write("%s  %s  %s\n" % (time.strftime("%H:%M:%S"), self.address_string(), fmt % args))
@@ -108,15 +146,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'")
         self.end_headers()
         self.wfile.write(body)
 
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode())
 
+    def _dash_authorized(self) -> bool:
+        if not DASH_PASSWORD:
+            return True  # explicit IOT_ALLOW_OPEN_DASHBOARD=1 demo mode
+        h = self.headers.get("Authorization", "")
+        if not h.startswith("Basic "):
+            return False
+        try:
+            user, _, pw = base64.b64decode(h[6:]).decode().partition(":")
+        except Exception:
+            return False
+        ok_u = hmac.compare_digest(user.encode(), DASH_USER.encode())
+        ok_p = hmac.compare_digest(pw.encode(), DASH_PASSWORD.encode())
+        return ok_u and ok_p
+
     # ---------------------------------------------------------------- GET
     def do_GET(self):
         url = urlparse(self.path)
+        if url.path != "/healthz" and not self._dash_authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="iot-dashboard"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         q = parse_qs(url.query)
         if url.path in ("/", "/index.html"):
             self._send(200, (HERE / "static" / "index.html").read_bytes(), "text/html; charset=utf-8")
@@ -170,11 +232,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(422, {"error": err})
 
         with _db_lock:
+            top = _db.execute("SELECT MAX(seq) FROM readings WHERE device = ? AND boot_id = ?",
+                              (clean["device"], clean["boot_id"])).fetchone()[0]
+            if top is not None and clean["seq"] <= top:
+                sys.stderr.write("  REJECTED: replayed or out-of-order seq\n")
+                return self._json(409, {"error": "replay"})
             _db.execute(
-                "INSERT INTO readings (received_at, device, seq, uptime_s, temp_c, pressure_hpa, rssi) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO readings (received_at, device, seq, uptime_s, temp_c, pressure_hpa, rssi, boot_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), clean["device"], clean["seq"], clean["uptime_s"],
-                 clean["temp_c"], clean["pressure_hpa"], clean["rssi"]),
+                 clean["temp_c"], clean["pressure_hpa"], clean["rssi"], clean["boot_id"]),
             )
             _db.commit()
         sys.stderr.write(
@@ -186,10 +253,23 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     key = get_key()
+    check_dashboard_auth_config()
     init_db()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.key = key
-    print(f"Dashboard: http://localhost:{PORT}/   (listening on {HOST}:{PORT}, db={DB_PATH})")
+    scheme = "http"
+    if TLS_CERT or TLS_KEY:
+        if not (TLS_CERT and TLS_KEY):
+            sys.exit("Set both IOT_TLS_CERT and IOT_TLS_KEY.")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        scheme = "https"
+    else:
+        print("WARNING: serving plain HTTP. Readings are signed but visible on the network; "
+              "set IOT_TLS_CERT/IOT_TLS_KEY for TLS.")
+    print(f"Dashboard: {scheme}://localhost:{PORT}/   (listening on {HOST}:{PORT}, db={DB_PATH})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

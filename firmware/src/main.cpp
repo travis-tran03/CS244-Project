@@ -13,6 +13,9 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <esp_system.h>
+#include <time.h>
 #include <mbedtls/md.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -22,6 +25,12 @@
 #include "secrets.h"
 #else
 #error "Copy firmware/include/secrets.h.example to firmware/include/secrets.h and fill it in."
+#endif
+
+// Optional: PEM of the CA (or self-signed server cert) to pin when SERVER_URL is https://.
+// We never call setInsecure(): an https URL without a pinned cert refuses to send.
+#ifndef SERVER_CA_CERT
+#define SERVER_CA_CERT nullptr
 #endif
 
 // ---- Lab 1 pin map ------------------------------------------------------------------------
@@ -38,6 +47,7 @@ Adafruit_SSD1306 oled(128, 64, &SPI, OLED_DC, OLED_RST, OLED_CS);
 Adafruit_BMP280 bmp(&Wire);
 
 bool oledOk = false, bmpOk = false;
+char bootId[9];                   // random per boot; signed into every message (replay protection)
 uint32_t seq = 0;                 // message counter; the dashboard uses it to spot lost messages
 uint32_t lastSample = 0, lastWifiTry = 0;
 bool lastPostOk = false;
@@ -109,17 +119,29 @@ bool initBmp() {
 
 // Build, sign and POST one message. Returns true when the server answered 200.
 bool postReading(float tempC, float presHpa) {
-  char body[200];
+  char body[240];
   int n = snprintf(body, sizeof(body),
-                   "{\"device\":\"%s\",\"seq\":%lu,\"uptime_s\":%lu,\"temp_c\":%.2f,\"pressure_hpa\":%.2f,\"rssi\":%d}",
-                   DEVICE_ID, (unsigned long)seq, (unsigned long)(millis() / 1000), tempC, presHpa, WiFi.RSSI());
+                   "{\"device\":\"%s\",\"boot_id\":\"%s\",\"seq\":%lu,\"uptime_s\":%lu,\"temp_c\":%.2f,\"pressure_hpa\":%.2f,\"rssi\":%d}",
+                   DEVICE_ID, bootId, (unsigned long)seq, (unsigned long)(millis() / 1000), tempC, presHpa, WiFi.RSSI());
   char sig[65];
   hmacHex(body, n, sig);
 
   HTTPClient http;
+  WiFiClientSecure tls;
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(SERVER_URL)) { lastHttp = -1; return false; }
+  bool ok;
+  if (strncmp(SERVER_URL, "https://", 8) == 0) {
+    if (SERVER_CA_CERT == nullptr) {
+      Serial.println("TLS: https URL but no SERVER_CA_CERT pinned; refusing to send");
+      lastHttp = -2; return false;
+    }
+    tls.setCACert(SERVER_CA_CERT);          // verifies chain, hostname/IP and validity dates (needs NTP time)
+    ok = http.begin(tls, SERVER_URL);
+  } else {
+    ok = http.begin(SERVER_URL);            // plain HTTP: signed but readable on the network
+  }
+  if (!ok) { lastHttp = -1; return false; }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Signature", sig);
   lastHttp = http.POST((uint8_t *)body, n);   // negative = transport error, else HTTP status
@@ -136,6 +158,14 @@ void setup() {
 
   pinMode(LED_RED, OUTPUT); pinMode(LED_YELLOW, OUTPUT); pinMode(LED_GREEN, OUTPUT);
   setLeds(true, false, false);
+
+  // Refuse to run with the example/placeholder credentials.
+  if (strncmp(SHARED_KEY, "change-me", 9) == 0 || strlen(SHARED_KEY) < 16) {
+    Serial.println("FATAL: SHARED_KEY is a placeholder or shorter than 16 chars. Edit secrets.h.");
+    while (true) delay(1000);
+  }
+  snprintf(bootId, sizeof(bootId), "%08lx", (unsigned long)esp_random());  // hardware RNG
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // wall clock, needed for TLS cert validity
 
   SPI.begin();
   oledOk = oled.begin(SSD1306_SWITCHCAPVCC);
